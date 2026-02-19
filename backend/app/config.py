@@ -3,8 +3,13 @@ Zia AI — Application Configuration
 Pydantic Settings with env-based loading.
 """
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 from typing import List
+
+# Resolve .env path absolutely so it loads regardless of CWD
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -40,6 +45,11 @@ class Settings(BaseSettings):
     SPOTIFY_CLIENT_ID: str = ""
     SPOTIFY_CLIENT_SECRET: str = ""
 
+    # ── Google OAuth 2.0 ──
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/google/callback"
+
     # ── Twilio ──
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
@@ -55,7 +65,7 @@ class Settings(BaseSettings):
     WORKER_MAX_JOBS: int = 10
     WORKER_JOB_TIMEOUT: int = 300
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": str(_ENV_FILE), "env_file_encoding": "utf-8"}
 
 
 settings = Settings()

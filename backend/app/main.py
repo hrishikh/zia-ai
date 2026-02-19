@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import settings
 from app.database import engine, Base
@@ -23,6 +22,8 @@ async def lifespan(app: FastAPI):
     """Startup: create tables. Shutdown: dispose engine."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # Temporary debug: confirm env vars loaded
+    print("Loaded GOOGLE_CLIENT_ID:", settings.GOOGLE_CLIENT_ID)
     yield
     await engine.dispose()
 
@@ -47,7 +48,6 @@ app.add_middleware(
     expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-API-Version"],
 )
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.ALLOWED_HOSTS)
-app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
 app.add_middleware(PrometheusMiddleware)
 app.add_middleware(APIVersionMiddleware)
 app.add_middleware(SlidingWindowRateLimiter)
@@ -61,3 +61,9 @@ app.add_route("/metrics", metrics_endpoint)
 async def health_check():
     """Basic health check endpoint."""
     return {"status": "healthy", "version": "1.0.0", "service": "zia-ai"}
+
+
+@app.get("/debug/env", tags=["system"])
+async def debug_env():
+    """Temporary: confirm env vars are loaded (remove before production)."""
+    return {"google_client_id_loaded": bool(settings.GOOGLE_CLIENT_ID)}

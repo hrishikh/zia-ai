@@ -7,6 +7,7 @@ import uuid as _uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +29,11 @@ from app.schemas.auth import (
     RegisterRequest,
     TokenResponse,
     UserResponse,
+)
+from app.services.google_oauth import (
+    build_google_auth_url,
+    exchange_code_for_tokens,
+    get_google_user_info,
 )
 
 router = APIRouter()
@@ -58,11 +64,21 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
-    """Login and receive JWT tokens."""
+    """Login with email/password and receive JWT tokens."""
     result = await db.execute(select(User).where(User.email == request.email))
     user = result.scalar_one_or_none()
 
-    if not user or not verify_password(request.password, user.password_hash):
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Block Google-only users from password login
+    if user.provider == "google" and not user.password_hash:
+        raise HTTPException(
+            status_code=400,
+            detail="This account uses Google Sign-In. Please log in with Google.",
+        )
+
+    if not verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if not user.is_active:
@@ -177,3 +193,74 @@ async def revoke_service(
 
     service.status = "revoked"
     await db.flush()
+
+
+# ── Google OAuth 2.0 (Stateless) ────────────────────────
+
+
+@router.get("/google/login", tags=["google-oauth"])
+async def google_login():
+    """Redirect to Google OAuth authorization page."""
+    auth_url = build_google_auth_url()
+    return RedirectResponse(url=auth_url)
+
+
+@router.get("/google/callback", response_model=TokenResponse, tags=["google-oauth"])
+async def google_callback(
+    code: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange Google auth code for Zia AI JWT tokens. Fully stateless."""
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code")
+
+    # Exchange code → Google tokens
+    google_tokens = await exchange_code_for_tokens(code)
+    google_access_token = google_tokens.get("access_token")
+    if not google_access_token:
+        raise HTTPException(status_code=502, detail="Google did not return an access token")
+
+    # Fetch Google user info
+    user_info = await get_google_user_info(google_access_token)
+    email = user_info["email"]
+    name = user_info.get("name") or email.split("@")[0]
+    picture = user_info.get("picture")
+
+    # Lookup or create user
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+
+    if user:
+        # Existing user — update avatar if empty
+        if not user.avatar_url and picture:
+            user.avatar_url = picture
+        user.last_login = datetime.utcnow()
+    else:
+        # New user — create with Google provider
+        user = User(
+            email=email,
+            display_name=name,
+            provider="google",
+            password_hash=None,
+            avatar_url=picture,
+        )
+        db.add(user)
+        await db.flush()
+        await db.refresh(user)
+        user.last_login = datetime.utcnow()
+
+    await db.flush()
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account disabled")
+
+    # Issue Zia AI JWT tokens
+    access = create_access_token(str(user.id), user.role)
+    refresh = create_refresh_token(str(user.id))
+
+    from app.config import settings
+    return TokenResponse(
+        access_token=access,
+        refresh_token=refresh,
+        expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )

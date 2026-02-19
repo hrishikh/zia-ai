@@ -11,6 +11,13 @@ backend/.env
 frontend/.env
 .env.*
 
+# Database
+*.db
+
+# OAuth / Secrets
+client_secret.json
+token.json
+
 # Node
 node_modules/
 frontend/node_modules/
@@ -18,6 +25,10 @@ frontend/node_modules/
 # Next.js
 .next/
 frontend/.next/
+
+# Executables
+*.exe
+ngrok.exe
 
 # OS
 .DS_Store
