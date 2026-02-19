@@ -1,0 +1,715 @@
+# Zia AI — Production Architecture Refinements
+
+> Deep-dive companion to [implementation_plan.md](file:///C:/Users/Hrishik/.gemini/antigravity/brain/93698a3c-647b-4ffb-a532-80c7cd3edc49/implementation_plan.md). These six sections supersede the corresponding shallow sections in the original plan.
+
+---
+
+## R1. Multi-Layer Rate Limiting
+
+Three distinct layers — each stops a different threat class.
+
+### Layer Architecture
+
+```mermaid
+graph LR
+    Client -->|"L1: IP-based"| Nginx["Nginx (conn limit)"]
+    Nginx -->|"L2: Token-bucket"| Middleware["FastAPI Middleware"]
+    Middleware -->|"L3: Action-aware"| Engine["Action Engine"]
+
+    style Nginx fill:#e74c3c,color:#fff
+    style Middleware fill:#f39c12,color:#fff
+    style Engine fill:#27ae60,color:#fff
+```
+
+| Layer | Where | Algorithm | Scope | Purpose |
+|-------|-------|-----------|-------|---------|
+| **L1** | Nginx | `limit_req_zone` leaky bucket | Per-IP | DDoS / brute-force defense |
+| **L2** | FastAPI middleware | Sliding-window (Redis) | Per-user-per-endpoint | API abuse prevention |
+| **L3** | Action Engine | Token bucket + daily cap (Redis) | Per-user-per-action-type | Business-logic throttling |
+
+### L2 — FastAPI Sliding-Window Middleware (Redis-backed)
+
+```python
+# backend/app/middleware/rate_limit.py
+
+import time, hashlib
+from fastapi import Request, HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from app.config import settings
+import redis.asyncio as aioredis
+
+# Tier definitions: role → (requests, window_seconds)
+TIERS = {
+    "anonymous": (20, 60),    # 20 req/min
+    "user":      (60, 60),    # 60 req/min
+    "admin":     (200, 60),   # 200 req/min
+}
+
+# Per-endpoint overrides (path_prefix → per-user per window)
+ENDPOINT_LIMITS = {
+    "/api/v1/auth/login":    (5,  60),   # 5/min — anti-brute-force
+    "/api/v1/auth/register": (3,  300),  # 3/5min
+    "/api/v1/actions/execute": (30, 60), # 30/min
+    "/api/v1/audit/export":  (2,  3600), # 2/hour
+}
+
+class SlidingWindowRateLimiter(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        self.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+
+    async def dispatch(self, request: Request, call_next):
+        # Identify user (JWT sub claim or IP for anonymous)
+        user_id = getattr(request.state, "user_id", None)
+        role = getattr(request.state, "user_role", "anonymous")
+        identity = user_id or request.client.host
+
+        # Determine limit
+        path = request.url.path
+        for prefix, limit in ENDPOINT_LIMITS.items():
+            if path.startswith(prefix):
+                max_req, window = limit
+                break
+        else:
+            max_req, window = TIERS.get(role, TIERS["anonymous"])
+
+        # Sliding window counter in Redis
+        key = f"rl:{identity}:{hashlib.md5(path.encode()).hexdigest()[:8]}"
+        now = time.time()
+        pipe = self.redis.pipeline()
+        pipe.zremrangebyscore(key, 0, now - window)  # Purge expired
+        pipe.zadd(key, {str(now): now})              # Add current
+        pipe.zcard(key)                               # Count
+        pipe.expire(key, window)
+        _, _, count, _ = await pipe.execute()
+
+        # Inject headers
+        request.state.rate_limit_remaining = max(0, max_req - count)
+
+        if count > max_req:
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "rate_limit_exceeded", "retry_after": window},
+                headers={"Retry-After": str(window), "X-RateLimit-Limit": str(max_req)}
+            )
+
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(max_req)
+        response.headers["X-RateLimit-Remaining"] = str(request.state.rate_limit_remaining)
+        return response
+```
+
+### L3 — Action-Level Rate Limiting
+
+```python
+# Inside action_engine.py — called before every execution
+
+async def check_action_rate_limit(self, user_id: str, schema: ActionSchema) -> None:
+    """Enforce cooldown + daily cap from ActionSchema."""
+    redis = self.redis
+    now = time.time()
+
+    # 1. Per-action cooldown
+    if schema.cooldown_seconds > 0:
+        cooldown_key = f"cd:{user_id}:{schema.action_type}"
+        last = await redis.get(cooldown_key)
+        if last and (now - float(last)) < schema.cooldown_seconds:
+            remaining = schema.cooldown_seconds - (now - float(last))
+            raise ActionThrottled(f"Cooldown active. Retry in {remaining:.0f}s")
+        await redis.set(cooldown_key, str(now), ex=schema.cooldown_seconds)
+
+    # 2. Daily execution cap
+    if schema.max_daily_executions > 0:
+        day_key = f"daily:{user_id}:{schema.action_type}:{time.strftime('%Y%m%d')}"
+        count = await redis.incr(day_key)
+        if count == 1:
+            await redis.expire(day_key, 86400)
+        if count > schema.max_daily_executions:
+            raise ActionThrottled(f"Daily limit ({schema.max_daily_executions}) reached")
+```
+
+---
+
+## R2. Async Task Handling (ARQ Worker Architecture)
+
+Actions like sending emails, making calls, and browser automation are **never** executed inline in the HTTP request cycle. They are dispatched to a background worker pool.
+
+### Architecture
+
+```mermaid
+graph LR
+    subgraph API["FastAPI (HTTP Thread)"]
+        Req["POST /actions/execute"]
+        Validate["Validate + Confirm Check"]
+        Enqueue["Enqueue to Redis"]
+    end
+
+    subgraph Queue["Redis Streams"]
+        Q1["zia:tasks:high"]
+        Q2["zia:tasks:default"]
+        Q3["zia:tasks:low"]
+    end
+
+    subgraph Workers["ARQ Workers (N processes)"]
+        W1["Worker 1"]
+        W2["Worker 2"]
+        W3["Worker N"]
+    end
+
+    subgraph Notify["Result Delivery"]
+        WS["WebSocket push"]
+        DB["DB status update"]
+    end
+
+    Req --> Validate --> Enqueue --> Queue
+    Queue --> Workers
+    Workers --> Notify
+```
+
+### Priority Queues
+
+| Queue | Priority | Used For | Max Concurrency |
+|-------|----------|----------|----------------|
+| `zia:tasks:high` | Urgent | Voice-triggered actions, confirmations | 4 |
+| `zia:tasks:default` | Normal | Email, WhatsApp, file ops | 8 |
+| `zia:tasks:low` | Background | Macros, log export, cleanup | 2 |
+
+### ARQ Worker Configuration
+
+```python
+# backend/app/worker.py
+
+from arq import create_pool, cron
+from arq.connections import RedisSettings
+from app.config import settings
+from app.executors import get_executor
+
+async def execute_action(ctx, execution_id: str, action_type: str,
+                         params: dict, user_id: str):
+    """ARQ task: execute an action via the appropriate executor."""
+    db = ctx["db"]
+    redis = ctx["redis"]
+
+    # 1. Mark as executing
+    await db.update_action_status(execution_id, "executing")
+    await redis.publish(f"ws:{user_id}", f'{{"execution_id":"{execution_id}","status":"executing"}}')
+
+    try:
+        executor = get_executor(action_type)
+        result = await executor.execute(action_type, params, user_id)
+
+        # 2. Mark completed
+        await db.update_action_result(execution_id, "completed", result)
+        await redis.publish(f"ws:{user_id}", f'{{"execution_id":"{execution_id}","status":"completed"}}')
+        return result
+
+    except Exception as e:
+        await db.update_action_result(execution_id, "failed", error=str(e))
+        await redis.publish(f"ws:{user_id}", f'{{"execution_id":"{execution_id}","status":"failed"}}')
+        raise
+
+async def expire_confirmations(ctx):
+    """Cron: expire stale pending confirmations every 60s."""
+    db = ctx["db"]
+    expired = await db.expire_pending_confirmations()
+    if expired:
+        ctx["logger"].info(f"Expired {expired} stale confirmations")
+
+async def refresh_oauth_tokens(ctx):
+    """Cron: proactively refresh tokens expiring within 10 minutes."""
+    db = ctx["db"]
+    expiring = await db.get_expiring_tokens(minutes=10)
+    for token in expiring:
+        await ctx["auth_service"].refresh_token(token.user_id, token.service)
+
+class WorkerSettings:
+    redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
+    functions = [execute_action]
+    cron_jobs = [
+        cron(expire_confirmations, second=0),           # Every minute
+        cron(refresh_oauth_tokens, minute={0, 30}),     # Every 30 min
+    ]
+    max_jobs = 10
+    job_timeout = 300   # 5 min max per action
+    retry_jobs = 3
+    queue_name = "zia:tasks:default"
+```
+
+### HTTP → Worker Dispatch Pattern
+
+```python
+# backend/app/api/v1/actions.py — key flow
+
+@router.post("/execute", response_model=ActionResponse)
+async def execute_action(req: ActionRequest, user=Depends(get_current_user),
+                         db=Depends(get_db), redis=Depends(get_redis)):
+    schema = ACTION_REGISTRY.get(req.action_type)
+    if not schema:
+        raise HTTPException(404, "Unknown action type")
+
+    # Rate limit check
+    await action_engine.check_action_rate_limit(user.id, schema)
+
+    # Confirmation check
+    needs_confirm, reasons = confirm_engine.evaluate(schema, req.params, user)
+    execution = create_execution_record(schema, req, user)
+
+    if needs_confirm:
+        raw_token = confirm_engine.generate_token(execution)
+        await db.save_pending_confirmation(execution)
+        return ActionResponse(
+            execution_id=execution.execution_id,
+            status=ActionStatus.PENDING,
+            message="Confirmation required",
+            confirmation_required=True,
+            confirmation_token=raw_token,
+            action_preview=build_preview(schema, req.params),
+        )
+
+    # Enqueue to background worker (NOT executed inline)
+    pool = await create_pool(WorkerSettings.redis_settings)
+    job = await pool.enqueue_job(
+        "execute_action",
+        execution.execution_id, req.action_type, req.params, str(user.id),
+        _queue_name=get_queue_for_risk(schema.risk_level),
+    )
+    await db.save_action_log(execution, job_id=job.job_id)
+
+    return ActionResponse(
+        execution_id=execution.execution_id,
+        status=ActionStatus.EXECUTING,
+        message="Action queued for execution",
+    )
+```
+
+---
+
+## R3. API Versioning Strategy
+
+### Versioning Contract
+
+| Aspect | Decision |
+|--------|----------|
+| **Scheme** | URL-path prefix: `/api/v1/`, `/api/v2/` |
+| **Header** | `X-API-Version` response header echoes version |
+| **Deprecation** | `Sunset` + `Deprecation` headers (RFC 8594) |
+| **Parallel support** | Max 2 versions live simultaneously |
+| **Migration window** | 90 days from deprecation notice → removal |
+
+### Router Structure
+
+```python
+# backend/app/api/__init__.py
+
+from fastapi import APIRouter
+from app.api.v1.router import router as v1_router
+# from app.api.v2.router import router as v2_router  # Future
+
+api_router = APIRouter()
+api_router.include_router(v1_router, prefix="/v1", tags=["v1"])
+# api_router.include_router(v2_router, prefix="/v2", tags=["v2"])
+```
+
+### Version Negotiation Middleware
+
+```python
+# backend/app/middleware/versioning.py
+
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from datetime import datetime
+
+DEPRECATED_VERSIONS = {
+    # "v1": {"sunset": "2027-06-01", "successor": "v2"}
+}
+
+class APIVersionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        
+        # Extract version from path
+        path = request.url.path
+        version = None
+        for segment in path.split("/"):
+            if segment.startswith("v") and segment[1:].isdigit():
+                version = segment
+                break
+
+        if version:
+            response.headers["X-API-Version"] = version
+            if version in DEPRECATED_VERSIONS:
+                info = DEPRECATED_VERSIONS[version]
+                response.headers["Deprecation"] = "true"
+                response.headers["Sunset"] = info["sunset"]
+                response.headers["Link"] = f'</api/{info["successor"]}>; rel="successor-version"'
+
+        return response
+```
+
+### Breaking Change Migration Rules
+
+1. **Non-breaking** (no version bump): add optional field, add new endpoint, widen param type
+2. **Breaking** (new version): remove field, rename endpoint, change response shape, narrow types
+3. **Migration path**: old version returns `Deprecation` header → clients have 90 days → old version returns `410 Gone`
+
+---
+
+## R4. Token Encryption Strategy
+
+### Encryption Architecture
+
+```mermaid
+graph TB
+    subgraph Runtime["Application Runtime"]
+        MasterKey["Master Key<br/>(env var / Vault)"]
+        DEK["Data Encryption Key<br/>(derived per-user)"]
+    end
+
+    subgraph AtRest["Storage (PostgreSQL)"]
+        EncToken["AES-encrypted token blob"]
+        KeyID["key_version_id"]
+        Nonce["IV / nonce"]
+    end
+
+    MasterKey -->|"HKDF derive"| DEK
+    DEK -->|"Fernet encrypt"| EncToken
+```
+
+### Implementation: Envelope Encryption
+
+```python
+# backend/app/core/crypto.py
+
+import base64, os
+from cryptography.fernet import Fernet, MultiFernet
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from app.config import settings
+
+class TokenEncryptionService:
+    """Envelope encryption: Master Key → per-user DEK → token ciphertext."""
+
+    def __init__(self):
+        # Support key rotation: ENCRYPTION_KEY can be comma-separated
+        raw_keys = settings.ENCRYPTION_KEY.split(",")
+        self._fernets = [Fernet(k.strip().encode()) for k in raw_keys]
+        self._multi = MultiFernet(self._fernets)  # First key = primary
+
+    def _derive_user_key(self, user_id: str) -> Fernet:
+        """Derive a per-user key via HKDF from the master key."""
+        master_bytes = base64.urlsafe_b64decode(self._fernets[0]._signing_key)
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(), length=32,
+            salt=b"zia-user-token-v1",
+            info=user_id.encode(),
+        )
+        derived = base64.urlsafe_b64encode(hkdf.derive(master_bytes))
+        return Fernet(derived)
+
+    def encrypt(self, plaintext: str, user_id: str) -> str:
+        """Encrypt a token for storage."""
+        f = self._derive_user_key(user_id)
+        return f.encrypt(plaintext.encode()).decode()
+
+    def decrypt(self, ciphertext: str, user_id: str) -> str:
+        """Decrypt a stored token."""
+        f = self._derive_user_key(user_id)
+        return f.decrypt(ciphertext.encode()).decode()
+
+    def rotate_master_key(self, ciphertext: str) -> str:
+        """Re-encrypt under the newest master key (for key rotation)."""
+        return self._multi.rotate(ciphertext.encode()).decode()
+
+# Singleton
+crypto = TokenEncryptionService()
+```
+
+### Key Rotation Procedure
+
+```
+1. Generate new Fernet key:        python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+2. Prepend to ENCRYPTION_KEY:      ENCRYPTION_KEY="NEW_KEY,OLD_KEY"
+3. Run rotation migration:         python -m app.scripts.rotate_keys
+4. After full rotation, remove:    ENCRYPTION_KEY="NEW_KEY"
+```
+
+### Storage Schema (updated `oauth_tokens`)
+
+```sql
+ALTER TABLE oauth_tokens ADD COLUMN key_version  SMALLINT DEFAULT 1;
+ALTER TABLE oauth_tokens ADD COLUMN encrypted_at  TIMESTAMPTZ DEFAULT NOW();
+-- access_token_encrypted and refresh_token_encrypted hold Fernet ciphertext
+-- key_version tracks which master key was used (for rotation)
+```
+
+---
+
+## R5. Confirmation State Machine
+
+### Formal State Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created : Action submitted
+    
+    Created --> RulesEval : Evaluate rules
+    
+    RulesEval --> AutoApproved : No rules triggered
+    RulesEval --> PendingConfirmation : Rules triggered
+    
+    PendingConfirmation --> Confirmed : User confirms (valid token)
+    PendingConfirmation --> Rejected : User rejects
+    PendingConfirmation --> Expired : TTL exceeded (5 min)
+    PendingConfirmation --> Escalated : Admin override required
+    
+    Confirmed --> Queued : Enqueue to worker
+    AutoApproved --> Queued : Enqueue to worker
+    
+    Queued --> Executing : Worker picks up
+    Executing --> Completed : Success
+    Executing --> Failed : Error
+    Executing --> Retrying : Transient failure
+    
+    Retrying --> Executing : Retry attempt (max 3)
+    Retrying --> Failed : Max retries exceeded
+    
+    Escalated --> Confirmed : Admin approves
+    Escalated --> Rejected : Admin rejects
+    
+    Expired --> [*]
+    Rejected --> [*]
+    Completed --> [*]
+    Failed --> [*]
+```
+
+### State Enum + Transition Table
+
+```python
+# backend/app/core/state_machine.py
+
+from enum import Enum
+from typing import Optional
+
+class ConfirmationState(str, Enum):
+    CREATED         = "created"
+    RULES_EVAL      = "rules_eval"
+    AUTO_APPROVED   = "auto_approved"
+    PENDING         = "pending_confirmation"
+    CONFIRMED       = "confirmed"
+    REJECTED        = "rejected"
+    EXPIRED         = "expired"
+    ESCALATED       = "escalated"
+    QUEUED          = "queued"
+    EXECUTING       = "executing"
+    COMPLETED       = "completed"
+    FAILED          = "failed"
+    RETRYING        = "retrying"
+
+# Valid transitions: current_state → set of allowed next states
+TRANSITIONS: dict[ConfirmationState, set[ConfirmationState]] = {
+    ConfirmationState.CREATED:       {ConfirmationState.RULES_EVAL},
+    ConfirmationState.RULES_EVAL:    {ConfirmationState.AUTO_APPROVED, ConfirmationState.PENDING},
+    ConfirmationState.AUTO_APPROVED: {ConfirmationState.QUEUED},
+    ConfirmationState.PENDING:       {ConfirmationState.CONFIRMED, ConfirmationState.REJECTED,
+                                      ConfirmationState.EXPIRED, ConfirmationState.ESCALATED},
+    ConfirmationState.ESCALATED:     {ConfirmationState.CONFIRMED, ConfirmationState.REJECTED},
+    ConfirmationState.CONFIRMED:     {ConfirmationState.QUEUED},
+    ConfirmationState.QUEUED:        {ConfirmationState.EXECUTING},
+    ConfirmationState.EXECUTING:     {ConfirmationState.COMPLETED, ConfirmationState.FAILED,
+                                      ConfirmationState.RETRYING},
+    ConfirmationState.RETRYING:      {ConfirmationState.EXECUTING, ConfirmationState.FAILED},
+    # Terminal states: REJECTED, EXPIRED, COMPLETED, FAILED — no outgoing transitions
+}
+
+class ActionStateMachine:
+    """Enforces valid state transitions. Raises on illegal transition attempts."""
+
+    def __init__(self, current_state: ConfirmationState = ConfirmationState.CREATED):
+        self.state = current_state
+        self.history: list[tuple[ConfirmationState, ConfirmationState]] = []
+
+    def transition(self, target: ConfirmationState, reason: str = "") -> None:
+        allowed = TRANSITIONS.get(self.state, set())
+        if target not in allowed:
+            raise IllegalTransition(
+                f"Cannot transition {self.state.value} → {target.value}. "
+                f"Allowed: {[s.value for s in allowed]}"
+            )
+        self.history.append((self.state, target))
+        self.state = target
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state not in TRANSITIONS
+
+class IllegalTransition(Exception):
+    pass
+```
+
+### Integration with Action Engine
+
+```python
+# backend/app/core/action_engine.py (excerpt)
+
+async def process_action(self, request: ActionRequest, user) -> ActionResponse:
+    sm = ActionStateMachine()  # Starts at CREATED
+
+    # Step 1: Parse + validate
+    schema = ACTION_REGISTRY[request.action_type]
+    sm.transition(ConfirmationState.RULES_EVAL)
+
+    # Step 2: Evaluate confirmation rules
+    needs_confirm, reasons = self.confirm_engine.evaluate(schema, request.params, user)
+
+    if needs_confirm:
+        sm.transition(ConfirmationState.PENDING)
+        token = self.confirm_engine.generate_token(...)
+        await self.db.save_state(execution_id, sm.state, sm.history)
+        return ActionResponse(status="pending_confirmation", confirmation_token=token)
+
+    # Step 3: Auto-approved → queue
+    sm.transition(ConfirmationState.AUTO_APPROVED)
+    sm.transition(ConfirmationState.QUEUED)
+    await self.enqueue(execution_id, schema, request.params, user.id)
+    await self.db.save_state(execution_id, sm.state, sm.history)
+    return ActionResponse(status="queued", message="Executing...")
+```
+
+---
+
+## R6. Production Monitoring & Observability
+
+### Four Pillars
+
+```mermaid
+graph TB
+    subgraph Metrics["1. Metrics (Prometheus)"]
+        ReqRate["Request rate / latency (p50, p95, p99)"]
+        ErrRate["Error rate by endpoint"]
+        ActRate["Action execution rate by type"]
+        QueueSize["Worker queue depth"]
+    end
+    subgraph Logs["2. Structured Logs"]
+        AppLog["App JSON logs → stdout"]
+        AuditLog["Audit trail → PostgreSQL"]
+        AccessLog["Nginx access logs"]
+    end
+    subgraph Traces["3. Distributed Traces (OpenTelemetry)"]
+        ReqTrace["HTTP req → worker → executor → external API"]
+    end
+    subgraph Alerts["4. Alerting"]
+        Critical["P1: API down, DB unreachable → PagerDuty"]
+        Warning["P2: Error rate > 5%, queue depth > 50 → Slack"]
+        Info["P3: Daily limit hit, token refresh → Email"]
+    end
+```
+
+### Prometheus Metrics (FastAPI integration)
+
+```python
+# backend/app/middleware/metrics.py
+
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+import time
+
+# Metrics
+REQUEST_COUNT = Counter(
+    "zia_http_requests_total", "Total HTTP requests",
+    ["method", "endpoint", "status"]
+)
+REQUEST_LATENCY = Histogram(
+    "zia_http_request_duration_seconds", "Request latency",
+    ["method", "endpoint"],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+)
+ACTION_EXEC_COUNT = Counter(
+    "zia_actions_total", "Actions executed",
+    ["action_type", "status"]  # status: completed, failed
+)
+WORKER_QUEUE_DEPTH = Gauge(
+    "zia_worker_queue_depth", "Current worker queue depth",
+    ["queue"]
+)
+ACTIVE_WS_CONNECTIONS = Gauge(
+    "zia_active_websocket_connections", "Active WebSocket connections"
+)
+
+class PrometheusMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration = time.perf_counter() - start
+
+        endpoint = request.url.path
+        REQUEST_COUNT.labels(request.method, endpoint, response.status_code).inc()
+        REQUEST_LATENCY.labels(request.method, endpoint).observe(duration)
+        return response
+
+async def metrics_endpoint(request):
+    return Response(generate_latest(), media_type="text/plain")
+```
+
+### Alert Rules (Grafana / Prometheus)
+
+| Alert | Condition | Severity | Channel |
+|-------|-----------|----------|---------|
+| API Down | `up{job="zia-backend"} == 0` for 1m | P1-Critical | PagerDuty |
+| High Error Rate | `rate(zia_http_requests_total{status=~"5.."}[5m]) > 0.05` | P2-Warning | Slack |
+| Queue Backlog | `zia_worker_queue_depth > 50` for 5m | P2-Warning | Slack |
+| DB Connection Exhausted | `pg_stat_activity_count > 80` | P2-Warning | Slack |
+| Action Failure Spike | `rate(zia_actions_total{status="failed"}[10m]) > 0.1` | P2-Warning | Slack |
+| Token Refresh Failure | Custom audit log check | P3-Info | Email |
+
+### Docker Compose Addition (Monitoring Stack)
+
+```yaml
+# Add to deploy/docker-compose.prod.yml
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - zia-net
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    ports:
+      - "3001:3000"
+    networks:
+      - zia-net
+```
+
+---
+
+## Updated Folder Structure (New Files)
+
+```diff
+ backend/app/
++├── middleware/
++│   ├── __init__.py
++│   ├── rate_limit.py        # R1: Sliding-window rate limiter
++│   ├── versioning.py        # R3: API version negotiation
++│   └── metrics.py           # R6: Prometheus middleware
++├── core/
++│   ├── crypto.py            # R4: Envelope encryption service
++│   ├── state_machine.py     # R5: Confirmation state machine
++│   └── ...existing...
++├── worker.py                # R2: ARQ worker + cron jobs
++├── scripts/
++│   └── rotate_keys.py       # R4: Key rotation migration
+
+ deploy/
++├── monitoring/
++│   ├── prometheus.yml        # Scrape config
++│   └── grafana/
++│       └── dashboards/       # Pre-built Zia dashboard JSON
+```

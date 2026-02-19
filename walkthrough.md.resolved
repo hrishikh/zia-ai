@@ -1,0 +1,116 @@
+# Zia AI — Full System Walkthrough
+
+## Phase 2 + 3 + 4 Complete
+
+| Phase | Status | Files |
+|-------|--------|-------|
+| Backend (FastAPI) | ✅ | 49 |
+| Frontend (Next.js 14) | ✅ | 43 |
+| Deployment (Docker, Nginx) | ✅ | 4 |
+| **Total** | | **96 new files** |
+
+---
+
+## Frontend Architecture (Phase 3)
+
+### Layer Map
+
+```
+app/layout.tsx
+ └─ AuthProvider → ConfirmProvider → WebSocketProvider
+     └─ page.tsx (home) | listening/page.tsx | settings/page.tsx | login | register
+         └─ AppShell (WS status + nav)
+             └─ Components: MicButton, Waveform, Transcript, SuggestionCard, ActionFeed
+             └─ ConfirmModal (AnimatePresence, global)
+```
+
+### State Architecture
+
+| State | Owner | Mechanism |
+|-------|-------|-----------|
+| Auth (user + token) | [AuthContext](file:///d:/Zia%20AI/frontend/contexts/AuthContext.tsx#19-24) | In-memory access token, httpOnly refresh cookie |
+| WS connection | `WebSocketContext` | Singleton, exponential backoff |
+| Action feed | `Zustand actionStore` | Capped at 50 items |
+| Pending confirms | `Zustand actionStore` + [ConfirmContext](file:///d:/Zia%20AI/frontend/contexts/ConfirmContext.tsx#31-36) | Queue → modal |
+| Audit logs | [useAuditLogs](file:///d:/Zia%20AI/frontend/hooks/useAuditLogs.ts#17-39) | SWR with `keepPreviousData` |
+| Form state | Local `useState` | Per-page |
+
+### Security Decisions
+
+- Access token **never touches localStorage** (XSS protection)
+- Axios interceptor queues all in-flight requests during token refresh (prevents race conditions)
+- Middleware checks `zia_refresh_token` httpOnly cookie — cannot be forged by JS
+- Confirmation modal blocks confirm button for 3s on `critical` risk
+- TTL countdown computed from `created_at` server timestamp (not client start time)
+
+---
+
+## Key Files at a Glance
+
+### API + Data Layer
+- [client.ts](file:///d:/Zia%20AI/frontend/lib/api/client.ts) — Axios with queued 401 retry
+- [types.ts](file:///d:/Zia%20AI/frontend/lib/types.ts) — Complete TypeScript type surface
+
+### Contexts
+- [AuthContext.tsx](file:///d:/Zia%20AI/frontend/contexts/AuthContext.tsx) — JWT state + session restore
+- [WebSocketContext.tsx](file:///d:/Zia%20AI/frontend/contexts/WebSocketContext.tsx) — WS + backoff
+- [ConfirmContext.tsx](file:///d:/Zia%20AI/frontend/contexts/ConfirmContext.tsx) — Modal trigger
+
+### Hooks
+- [useVoice.ts](file:///d:/Zia%20AI/frontend/hooks/useVoice.ts) — Speech API + AudioContext waveform
+- [useConfirmation.ts](file:///d:/Zia%20AI/frontend/hooks/useConfirmation.ts) — Countdown + confirm/reject
+
+### Components
+- [MicButton.tsx](file:///d:/Zia%20AI/frontend/components/voice/MicButton.tsx) — Animated orb
+- [ConfirmModal.tsx](file:///d:/Zia%20AI/frontend/components/confirmation/ConfirmModal.tsx) — Full confirmation UI
+
+### Pages
+- [page.tsx](file:///d:/Zia%20AI/frontend/app/page.tsx) — Home dashboard
+- [listening/page.tsx](file:///d:/Zia%20AI/frontend/app/listening/page.tsx) — Voice session
+- [settings/page.tsx](file:///d:/Zia%20AI/frontend/app/settings/page.tsx) — 3-tab settings
+
+---
+
+## Getting Started
+
+### Local Development
+
+```bash
+# 1. Copy env
+cp frontend/.env.local.example frontend/.env.local
+# Edit .env.local: point NEXT_PUBLIC_API_URL to your backend
+
+# 2. Install
+cd frontend && npm install
+
+# 3. Run dev server
+npm run dev   # → http://localhost:3000
+
+# 4. Type check
+npm run type-check
+```
+
+### Production Docker Build
+
+```bash
+docker build \
+  --build-arg NEXT_PUBLIC_API_URL=https://zia.yourdomain.com/api/v1 \
+  --build-arg NEXT_PUBLIC_WS_URL=wss://zia.yourdomain.com/api/v1/ws \
+  -t zia-frontend ./frontend
+```
+
+### Full Stack (Docker Compose)
+
+```bash
+cd deploy
+cp ../backend/.env.example ../backend/.env  # fill in secrets
+docker compose -f docker-compose.prod.yml up -d
+```
+
+Services accessible:
+| Service | URL |
+|---------|-----|
+| Frontend | https://zia.yourdomain.com |
+| API | https://zia.yourdomain.com/api/v1 |
+| Prometheus | http://host:9090 |
+| Grafana | http://host:3001 |

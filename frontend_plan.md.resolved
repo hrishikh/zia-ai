@@ -1,0 +1,337 @@
+# Zia AI — Frontend Implementation Plan (Phase 3)
+
+> **Stack:** Next.js 14 App Router · Tailwind CSS · Framer Motion · Zustand · Axios · Web Speech API
+
+---
+
+## Folder Structure
+
+```
+frontend/
+├── app/                          # Next.js App Router
+│   ├── layout.tsx                # Root layout (providers, fonts, global styles)
+│   ├── page.tsx                  # Home dashboard (/)
+│   ├── login/page.tsx
+│   ├── register/page.tsx
+│   ├── listening/page.tsx        # Active voice session
+│   ├── settings/page.tsx
+│   └── audit/page.tsx
+│
+├── components/
+│   ├── layout/
+│   │   ├── AppShell.tsx          # Sidebar + header wrapper
+│   │   ├── TopBar.tsx
+│   │   └── BottomTray.tsx        # Voice / Image / Text mode switcher
+│   ├── voice/
+│   │   ├── MicButton.tsx         # Central animated mic orb
+│   │   ├── Waveform.tsx          # Live audio waveform bars
+│   │   └── Transcript.tsx        # Real-time transcript display
+│   ├── actions/
+│   │   ├── SuggestionCard.tsx    # Glassmorphism action suggestion card
+│   │   ├── SuggestionGrid.tsx    # 4-card grid
+│   │   ├── ActionFeed.tsx        # Recent activity feed
+│   │   └── ActionFeedItem.tsx
+│   ├── confirmation/
+│   │   ├── ConfirmModal.tsx      # Full confirmation dialog with countdown
+│   │   ├── HighRiskConfirm.tsx   # Token-based high-risk variant
+│   │   └── CountdownTimer.tsx
+│   ├── auth/
+│   │   ├── LoginForm.tsx
+│   │   └── RegisterForm.tsx
+│   ├── settings/
+│   │   ├── ConnectedServices.tsx
+│   │   ├── ServiceCard.tsx
+│   │   └── AuditLogViewer.tsx
+│   └── ui/
+│       ├── GlassCard.tsx         # Reusable glassmorphism card
+│       ├── Button.tsx
+│       ├── Badge.tsx
+│       ├── Spinner.tsx
+│       └── StatusDot.tsx
+│
+├── contexts/
+│   ├── AuthContext.tsx           # JWT state, login/logout
+│   ├── WebSocketContext.tsx      # WS connection + message dispatch
+│   └── ConfirmContext.tsx        # Open/close confirmation modals
+│
+├── stores/
+│   └── actionStore.ts            # Zustand: action feed, pending confirmations
+│
+├── hooks/
+│   ├── useVoice.ts               # Web Speech API abstraction
+│   ├── useActionExecution.ts     # POST /actions/execute
+│   ├── useConfirmation.ts        # POST /actions/confirm + timer logic
+│   └── useAuditLogs.ts           # GET /audit/logs (paginated)
+│
+├── lib/
+│   ├── api/
+│   │   ├── client.ts             # Axios instance with interceptors
+│   │   ├── actions.ts            # /actions endpoints
+│   │   ├── auth.ts               # /auth endpoints
+│   │   ├── audit.ts              # /audit endpoints
+│   │   └── services.ts           # /oauth service management
+│   ├── constants.ts
+│   └── types.ts                  # Shared TypeScript types
+│
+├── styles/
+│   └── globals.css               # Tailwind base + design tokens
+│
+├── public/
+│   └── fonts/                    # Self-hosted Sora font
+│
+├── .env.local.example
+├── next.config.ts
+├── tailwind.config.ts
+├── tsconfig.json
+└── Dockerfile
+```
+
+---
+
+## Design System Tokens
+
+```ts
+// tailwind.config.ts
+colors: {
+  "zia-navy":  "#0b0d1a",
+  "zia-deep":  "#10122a",
+  "zia-purple":"#6c4de6",
+  "zia-glow":  "#8b5cf6",
+  "zia-amber": "#f59e0b",
+  "zia-glass": "rgba(255,255,255,0.06)",
+  "zia-border":"rgba(255,255,255,0.08)",
+}
+fontSize: { hero: ["3.5rem", "1.1"], display: ["2rem", "1.2"] }
+fontFamily: { sora: ["Sora", "sans-serif"] }
+backdropBlur: { glass: "16px" }
+```
+
+**Glassmorphism base class:**
+```css
+.glass-card {
+  background: rgba(255,255,255,0.06);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 1.25rem;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+```
+
+---
+
+## Auth Context & JWT Flow
+
+```
+AuthContext
+  ├── state: { user, accessToken, isLoading }
+  ├── login(email, password) → POST /auth/login → store tokens in memory
+  ├── refresh() → POST /auth/refresh → silent token renewal
+  └── logout() → POST /auth/logout → clear state
+```
+
+- Access token stored **in memory only** (not localStorage) to prevent XSS
+- Refresh token in an `httpOnly` cookie (set by backend)
+- Axios interceptor silently refreshes on 401 and retries original request
+- Protected routes via middleware.ts (`matcher: ['/dashboard', '/settings', '/audit']`)
+
+---
+
+## API Client with Interceptors
+
+```ts
+// lib/api/client.ts
+const api = axios.create({ baseURL: process.env.NEXT_PUBLIC_API_URL, withCredentials: true })
+
+// Request: inject Authorization header
+api.interceptors.request.use(addBearerToken)
+
+// Response: on 401, call /auth/refresh, retry once
+api.interceptors.response.use(null, handle401WithRefresh)
+```
+
+---
+
+## WebSocket Integration
+
+```ts
+// WebSocketContext.tsx
+// Connect: ws(s)://<host>/api/v1/ws/voice?token=<accessToken>
+// Message types received:
+//   { type: "action_result", data: ActionResponse }
+//   { type: "status_update", execution_id, status }
+// Message types sent:
+//   { type: "action", input_text: "..." }
+//   { type: "ping" }
+// On disconnect: exponential backoff reconnect (max 5 attempts)
+```
+
+---
+
+## Voice Hook (`useVoice.ts`)
+
+```ts
+// State: idle | listening | processing | error
+// SpeechRecognition → interim + final transcript
+// On final transcript → send via WebSocket or POST /actions/execute
+// Waveform: analyzeAudio() with AudioContext + AnalyserNode
+```
+
+---
+
+## Confirmation Modal Logic
+
+```
+ConfirmContext.openConfirm(confirmation: PendingConfirmation)
+  → renders ConfirmModal with:
+     - Action preview (type, params, risk badge)
+     - Triggered rules list
+     - Countdown timer (5-min TTL from token creation)
+     - [Confirm] → POST /actions/confirm { execution_id, confirmation_token }
+     - [Reject] → POST /actions/reject
+     - On timer expiry → auto-dismiss with "Expired" state
+```
+
+High-risk variant adds:
+- Red border glow
+- "This cannot be undone" warning
+- 3-second delay before Confirm button becomes clickable
+
+---
+
+## Pages
+
+### `/` — Home Dashboard
+- Greeting header: "Hello, [displayName]"
+- Subtitle: "What are we going to do today?"
+- `SuggestionGrid` (4 most-used/recent action types from `/audit/stats`)
+- `MicButton` (center, large animated orb)
+- `ActionFeed` (last 5 executions, real-time via WS)
+- `BottomTray` (Voice | Image | Text mode toggle)
+
+### `/listening` — Voice Session
+- Ambient waveform animation (full-screen dark)
+- Live transcript display
+- Action status indicator (Queued → Executing → Completed)
+- Stop button → navigate back to home
+
+### `/settings` — Settings
+- Connected services ([gmail](file:///d:/Zia%20AI/executor.py#26-59), `spotify`) with status badges
+- Revoke button → calls `DELETE /oauth/:service`
+- Token refresh dates
+- Tabbed: Services | Audit Logs | Profile
+
+### `/login`, `/register` — Auth
+- Glassmorphism form cards
+- Validation with react-hook-form + zod
+- Redirect to `/` on success
+
+---
+
+## State Management
+
+| State | Location | Why |
+|-------|----------|-----|
+| Auth (user, token) | `AuthContext` | Global, singleton |
+| WS connection | `WebSocketContext` | Singleton, reconnect logic |
+| Action feed items | `Zustand (actionStore)` | Frequently updated from WS |
+| Pending confirmations | `Zustand (actionStore)` | Triggers modal via ConfirmContext |
+| Form state | `react-hook-form` | Local to forms |
+| Audit logs | `SWR` in `useAuditLogs` | Paginatable, cacheable |
+
+---
+
+## Environment Variables
+
+```bash
+# .env.local.example
+NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+NEXT_PUBLIC_WS_URL=ws://localhost:8000/api/v1/ws
+NEXT_PUBLIC_APP_NAME=Zia AI
+```
+
+---
+
+## Dependencies
+
+```json
+"dependencies": {
+  "next": "14",
+  "react": "^18",
+  "framer-motion": "^11",
+  "axios": "^1.6",
+  "zustand": "^4.5",
+  "react-hook-form": "^7",
+  "zod": "^3",
+  "@hookform/resolvers": "^3",
+  "swr": "^2.2",
+  "clsx": "^2"
+}
+"devDependencies": {
+  "tailwindcss": "^3",
+  "autoprefixer": "^10",
+  "typescript": "^5"
+}
+```
+
+---
+
+## Production Build
+
+```bash
+# Install
+cd frontend && npm install
+
+# Dev
+npm run dev            # http://localhost:3000
+
+# Production
+npm run build          # .next/ output
+npm run start          # Production server
+
+# Docker
+docker build -t zia-frontend .
+docker run -p 3000:3000 zia-frontend
+```
+
+**Dockerfile:** Node 20 slim → multi-stage build → standalone output mode
+
+---
+
+## Files to Create (52 files)
+
+| # | Path | Notes |
+|---|------|-------|
+| 1 | `app/layout.tsx` | Providers, font, metadata |
+| 2 | `app/page.tsx` | Home dashboard |
+| 3 | `app/login/page.tsx` | Login |
+| 4 | `app/register/page.tsx` | Register |
+| 5 | `app/listening/page.tsx` | Voice session |
+| 6 | `app/settings/page.tsx` | Settings |
+| 7 | `app/audit/page.tsx` | Audit viewer |
+| 8 | `middleware.ts` | Protected route guards |
+| 9-15 | `components/layout/*` | AppShell, TopBar, BottomTray |
+| 16-18 | `components/voice/*` | MicButton, Waveform, Transcript |
+| 19-22 | `components/actions/*` | SuggestionCard/Grid, ActionFeed |
+| 23-25 | `components/confirmation/*` | ConfirmModal, HighRisk, Timer |
+| 26-27 | `components/auth/*` | LoginForm, RegisterForm |
+| 28-30 | `components/settings/*` | ConnectedServices, ServiceCard, AuditLogViewer |
+| 31-36 | `components/ui/*` | GlassCard, Button, Badge, Spinner, StatusDot |
+| 37-39 | `contexts/*` | AuthContext, WebSocketContext, ConfirmContext |
+| 40 | `stores/actionStore.ts` | Zustand store |
+| 41-44 | `hooks/*` | useVoice, useActionExecution, useConfirmation, useAuditLogs |
+| 45-49 | `lib/api/*` | client, actions, auth, audit, services |
+| 50 | `lib/types.ts` | Shared types |
+| 51 | `styles/globals.css` | Design tokens |
+| 52 | `tailwind.config.ts` | Extended theme |
+| 53 | `next.config.ts` | Config |
+| 54 | [Dockerfile](file:///d:/Zia%20AI/backend/Dockerfile) | Multi-stage build |
+
+---
+
+## Verification Plan
+
+- `npm run build` — zero TypeScript errors
+- Auth flow: register → login → protected route → refresh → logout
+- Voice: listen → transcript → action submit → WS status update
+- Confirmation: trigger HIGH risk action → modal with countdown → confirm
+- Settings: view connected services → revoke → service removed

@@ -1,0 +1,52 @@
+# ── Zia AI Backend — Production Requirements ──
+
+# Core
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.1.0
+httpx>=0.26.0
+
+# Database
+sqlalchemy[asyncio]>=2.0.25
+asyncpg>=0.29.0
+alembic>=1.13.0
+
+# Redis
+redis>=5.0.0
+
+# Background Worker
+arq>=0.25.0
+
+# Monitoring
+prometheus-client>=0.19.0
+# sentry-sdk[fastapi]>=1.40.0  # uncomment for Sentry
+
+# OAuth / Google
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-api-python-client>=2.100.0
+
+# Twilio
+twilio>=8.10.0
+
+# Browser Automation
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# Encryption
+cryptography>=41.0.0
+
+# Auth
+keyring>=24.0.0
+
+# Session
+starlette>=0.36.0
+
+# Voice (optional, for local mode)
+# SpeechRecognition>=3.10.0
+# pyttsx3>=2.90
+# pyaudio>=0.2.13
