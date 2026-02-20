@@ -4,7 +4,6 @@ Production-grade middleware stack, lifespan management, and route mounting.
 """
 
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -19,12 +18,16 @@ from app.middleware.metrics import PrometheusMiddleware, metrics_endpoint
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create tables. Shutdown: dispose engine."""
+    # Create tables on startup
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # Temporary debug: confirm env vars loaded
-    print("Loaded GOOGLE_CLIENT_ID:", settings.GOOGLE_CLIENT_ID)
+
+    print("🚀 Zia AI started successfully")
+    print("Loaded GOOGLE_CLIENT_ID:", bool(settings.GOOGLE_CLIENT_ID))
+
     yield
+
+    # Dispose DB engine on shutdown
     await engine.dispose()
 
 
@@ -38,19 +41,18 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-# ── Middleware Stack (order matters: last added = first executed) ──
+# ── Middleware ──
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-API-Version"],
 )
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.ALLOWED_HOSTS)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 app.add_middleware(PrometheusMiddleware)
 app.add_middleware(APIVersionMiddleware)
-app.add_middleware(SlidingWindowRateLimiter)
+# app.add_middleware(SlidingWindowRateLimiter)
 
 # ── Routes ──
 app.include_router(api_router, prefix="/api/v1")
@@ -59,11 +61,14 @@ app.add_route("/metrics", metrics_endpoint)
 
 @app.get("/health", tags=["system"])
 async def health_check():
-    """Basic health check endpoint."""
     return {"status": "healthy", "version": "1.0.0", "service": "zia-ai"}
+
+
+@app.get("/", tags=["system"])
+async def root():
+    return {"message": "Zia AI Backend Running"}
 
 
 @app.get("/debug/env", tags=["system"])
 async def debug_env():
-    """Temporary: confirm env vars are loaded (remove before production)."""
     return {"google_client_id_loaded": bool(settings.GOOGLE_CLIENT_ID)}
