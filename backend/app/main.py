@@ -41,10 +41,10 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-# ── CORS — first middleware, no duplicates ──
+# ── CORS — must be first middleware ──
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*-hrishikh175-2831s-projects\.vercel\.app",
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
