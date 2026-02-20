@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     ]
 
     # ── Database ──
-    DATABASE_URL: str = "postgresql+asyncpg://zia:password@localhost:5432/zia_db"
+    DATABASE_URL: str 
 
     # ── Redis ──
     REDIS_URL: str = "redis://localhost:6379/0"
