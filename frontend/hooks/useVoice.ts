@@ -2,6 +2,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { VoiceState } from "@/lib/types";
 
+// ── Interfaces ────────────────────────────────────────────────────────────────
+
 interface UseVoiceOptions {
     onFinalTranscript?: (text: string) => void;
     onInterimTranscript?: (text: string) => void;
@@ -19,7 +21,23 @@ interface UseVoiceReturn {
     isSupported: boolean;
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 const NUM_BARS = 16;
+
+/**
+ * Safely retrieves the SpeechRecognition constructor from window.
+ * Returns null when called during SSR or in unsupported browsers.
+ * Using a function (not `window.SpeechRecognition` inline) avoids the
+ * "type vs value" error that occurs when referencing the global interface
+ * as a constructor at runtime under strict mode.
+ */
+function getSpeechRecognitionConstructor(): SpeechRecognitionConstructor | null {
+    if (typeof window === "undefined") return null;
+    return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null;
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useVoice({
     onFinalTranscript,
@@ -32,17 +50,18 @@ export function useVoice({
     const [waveformBars, setWaveformBars] = useState<number[]>(Array(NUM_BARS).fill(0));
     const [error, setError] = useState<string | null>(null);
 
-    const recognitionRef = useRef<any>(null);
+    // recognitionRef is typed against the global SpeechRecognition interface
+    // declared in types/global.d.ts — no `any` needed.
+    const recognitionRef = useRef<SpeechRecognition | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
     const analyserRef = useRef<AnalyserNode | null>(null);
     const mediaStreamRef = useRef<MediaStream | null>(null);
-    const animFrameRef = useRef<number>();
+    const animFrameRef = useRef<number | undefined>(undefined);
 
-    const isSupported =
-        typeof window !== "undefined" &&
-        ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
+    const isSupported = getSpeechRecognitionConstructor() !== null;
 
-    // Waveform animation loop
+    // ── Waveform ─────────────────────────────────────────────────────────────
+
     const startWaveform = useCallback(async () => {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -57,7 +76,7 @@ export function useVoice({
             const buffer = new Uint8Array(analyser.frequencyBinCount);
             const tick = () => {
                 analyser.getByteFrequencyData(buffer);
-                const bars = Array.from({ length: NUM_BARS }, (_, i) => {
+                const bars = Array.from({ length: NUM_BARS }, (_: unknown, i: number) => {
                     const idx = Math.floor((i / NUM_BARS) * buffer.length);
                     return buffer[idx] / 255;
                 });
@@ -71,28 +90,30 @@ export function useVoice({
     }, []);
 
     const stopWaveform = useCallback(() => {
-        cancelAnimationFrame(animFrameRef.current!);
+        if (animFrameRef.current !== undefined) {
+            cancelAnimationFrame(animFrameRef.current);
+        }
         mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
         audioContextRef.current?.close();
         setWaveformBars(Array(NUM_BARS).fill(0));
     }, []);
 
+    // ── Recognition ──────────────────────────────────────────────────────────
+
     const startListening = useCallback(() => {
-        if (!isSupported) {
+        const SpeechRecognitionImpl = getSpeechRecognitionConstructor();
+
+        if (!SpeechRecognitionImpl) {
             setError("Speech recognition not supported in this browser");
             return;
         }
-
-        const SpeechRecognitionImpl =
-            (window as any).SpeechRecognition ||
-            (window as any).webkitSpeechRecognition;
 
         const recognition = new SpeechRecognitionImpl();
         recognition.continuous = true;
         recognition.interimResults = true;
         recognition.lang = language;
 
-        recognition.onresult = (event) => {
+        recognition.onresult = (event: SpeechRecognitionEvent) => {
             let interim = "";
             let final = "";
             for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -108,13 +129,14 @@ export function useVoice({
             onInterimTranscript?.(interim);
         };
 
-        recognition.onerror = (event) => {
+        recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
             setError(event.error);
             setState("error");
         };
 
         recognition.onend = () => {
-            if (state === "listening") recognition.start(); // keep alive
+            // Keep alive while the user is still in listening state
+            if (recognitionRef.current) recognition.start();
         };
 
         recognitionRef.current = recognition;
@@ -124,7 +146,7 @@ export function useVoice({
         setTranscript("");
         setInterimTranscript("");
         setError(null);
-    }, [isSupported, language, onFinalTranscript, onInterimTranscript, startWaveform, state]);
+    }, [language, onFinalTranscript, onInterimTranscript, startWaveform]);
 
     const stopListening = useCallback(() => {
         recognitionRef.current?.stop();
@@ -133,6 +155,8 @@ export function useVoice({
         setState("idle");
         setInterimTranscript("");
     }, [stopWaveform]);
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
 
     useEffect(() => {
         return () => {
