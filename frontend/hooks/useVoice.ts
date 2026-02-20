@@ -84,7 +84,8 @@ export function useVoice({
         }
 
         const SpeechRecognitionImpl =
-            window.SpeechRecognition || (window as unknown as { webkitSpeechRecognition: typeof SpeechRecognition }).webkitSpeechRecognition;
+            (window as any).SpeechRecognition ||
+            (window as any).webkitSpeechRecognition;
 
         const recognition = new SpeechRecognitionImpl();
         recognition.continuous = true;
