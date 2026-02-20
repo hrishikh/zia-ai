@@ -32,7 +32,7 @@ export function useVoice({
     const [waveformBars, setWaveformBars] = useState<number[]>(Array(NUM_BARS).fill(0));
     const [error, setError] = useState<string | null>(null);
 
-    const recognitionRef = useRef<SpeechRecognition | null>(null);
+    const recognitionRef = useRef<any>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
     const analyserRef = useRef<AnalyserNode | null>(null);
     const mediaStreamRef = useRef<MediaStream | null>(null);
