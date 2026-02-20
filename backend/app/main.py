@@ -42,10 +42,12 @@ app = FastAPI(
 )
 
 # ── CORS — must be the first middleware after app init ──
+# allow_origin_regex matches ALL *.vercel.app preview/production domains
+# so we never need to update this when the Vercel URL changes.
 app.add_middleware(
     CORSMiddleware,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_origins=[
-        "https://zia-ccsuo0hru-hrishikh175-2831s-projects.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
