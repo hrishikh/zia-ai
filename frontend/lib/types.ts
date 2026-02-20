@@ -1,5 +1,9 @@
 // ── Shared TypeScript Types for Zia AI Frontend ──
 
+// ───────────────────────────────────────────────
+// Core Enums
+// ───────────────────────────────────────────────
+
 export type RiskLevel = "low" | "medium" | "high" | "critical";
 
 export type ActionStatus =
@@ -19,7 +23,10 @@ export type ActionStatus =
 
 export type ActionSource = "voice" | "text" | "api" | "macro";
 
-// ── Auth ───────────────────────────────────────
+// ───────────────────────────────────────────────
+// Auth
+// ───────────────────────────────────────────────
+
 export interface User {
     id: string;
     email: string;
@@ -37,7 +44,10 @@ export interface TokenResponse {
     expires_in: number;
 }
 
-// ── Actions ────────────────────────────────────
+// ───────────────────────────────────────────────
+// Actions
+// ───────────────────────────────────────────────
+
 export interface ActionRequest {
     input_text?: string;
     action_type?: string;
@@ -45,7 +55,24 @@ export interface ActionRequest {
     source?: ActionSource;
 }
 
+/**
+ * This represents a suggested action preview
+ * returned before confirmation.
+ */
 export interface ActionPreview {
+    action: string;
+    description: string;
+    risk_level: RiskLevel;
+    params: Record<string, unknown>;
+    reasons: string[];
+    expires_in_seconds: number;
+}
+
+/**
+ * UI-friendly schema for suggestion cards.
+ * This fixes the missing ActionSchema error.
+ */
+export interface ActionSchema {
     action: string;
     description: string;
     risk_level: RiskLevel;
@@ -76,7 +103,10 @@ export interface ActionHistoryItem {
     message?: string;
 }
 
-// ── Confirmation ───────────────────────────────
+// ───────────────────────────────────────────────
+// Confirmation
+// ───────────────────────────────────────────────
+
 export interface PendingConfirmation {
     execution_id: string;
     confirmation_token: string;
@@ -85,7 +115,10 @@ export interface PendingConfirmation {
     created_at: string;
 }
 
-// ── Connected Services ─────────────────────────
+// ───────────────────────────────────────────────
+// Connected Services
+// ───────────────────────────────────────────────
+
 export interface ConnectedService {
     service: string;
     status: "active" | "expired" | "revoked";
@@ -93,7 +126,10 @@ export interface ConnectedService {
     scopes: string[];
 }
 
-// ── Audit ──────────────────────────────────────
+// ───────────────────────────────────────────────
+// Audit
+// ───────────────────────────────────────────────
+
 export interface AuditLogEntry {
     id: string;
     user_id: string;
@@ -117,7 +153,10 @@ export interface AuditStats {
     risk_distribution: Record<RiskLevel, number>;
 }
 
-// ── WebSocket ──────────────────────────────────
+// ───────────────────────────────────────────────
+// WebSocket
+// ───────────────────────────────────────────────
+
 export interface WsMessage {
     type: "action_result" | "status_update" | "pong" | "error";
     data?: ActionResponse;
@@ -126,5 +165,8 @@ export interface WsMessage {
     error?: string;
 }
 
-// ── Voice ──────────────────────────────────────
+// ───────────────────────────────────────────────
+// Voice
+// ───────────────────────────────────────────────
+
 export type VoiceState = "idle" | "listening" | "processing" | "error";
