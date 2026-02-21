@@ -72,3 +72,8 @@ async def root():
 @app.get("/debug/env", tags=["system"])
 async def debug_env():
     return {"google_client_id_loaded": bool(settings.GOOGLE_CLIENT_ID)}
+
+
+@app.get("/cors-test", tags=["system"])
+def cors_test():
+    return {"status": "ok"}

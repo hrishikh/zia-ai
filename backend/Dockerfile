@@ -18,5 +18,5 @@ USER appuser
 
 EXPOSE 8000
 
-# Production: 4 uvicorn workers
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Production: 4 uvicorn workers, use $PORT from Render (default 8000 for local dev)
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4
