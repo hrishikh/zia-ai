@@ -1,6 +1,6 @@
 "use client";
-import { useEffect } from "react";
-import { motion } from "framer-motion";
+import { useEffect, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
 import { useVoice } from "@/hooks/useVoice";
@@ -13,14 +13,27 @@ import { Button } from "@/components/ui/Button";
 export default function ListeningPage() {
     const router = useRouter();
     const { isAuthenticated } = useAuth();
-    const { execute, isLoading: isExecuting } = useActionExecution();
+    const { execute, isLoading: isExecuting, error: execError } = useActionExecution();
+    const [ziaReply, setZiaReply] = useState<string | null>(null);
 
     const {
         state, waveformBars, startListening, stopListening,
         transcript, interimTranscript,
     } = useVoice({
         onFinalTranscript: async (text) => {
-            await execute({ input_text: text, source: "voice" });
+            const result = await execute({ input_text: text, source: "voice" });
+            const reply = (result as any)?.response;
+            if (reply) {
+                setZiaReply(reply);
+                // Speak the reply via browser TTS
+                if (typeof window !== "undefined" && window.speechSynthesis) {
+                    window.speechSynthesis.cancel();
+                    const utterance = new SpeechSynthesisUtterance(reply);
+                    utterance.lang = "en-US";
+                    utterance.rate = 1.0;
+                    window.speechSynthesis.speak(utterance);
+                }
+            }
         },
     });
 
@@ -65,6 +78,36 @@ export default function ListeningPage() {
 
             {/* Live transcript */}
             <Transcript finalText={transcript} interimText={interimTranscript} />
+
+            {/* Zia response */}
+            <AnimatePresence mode="wait">
+                {isExecuting && (
+                    <motion.p
+                        key="thinking"
+                        className="text-sm text-purple-400 italic"
+                        initial={{ opacity: 0, y: 4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0 }}
+                    >
+                        Zia is thinking…
+                    </motion.p>
+                )}
+                {!isExecuting && (ziaReply || execError) && (
+                    <motion.div
+                        key="response"
+                        className="max-w-lg text-center px-4 py-3 rounded-xl bg-white/5 border border-white/10"
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0 }}
+                    >
+                        <p className="text-sm text-white/85 leading-relaxed">
+                            {execError
+                                ? <span className="text-red-400">{execError}</span>
+                                : ziaReply}
+                        </p>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {/* Controls */}
             <div className="flex items-center gap-4">

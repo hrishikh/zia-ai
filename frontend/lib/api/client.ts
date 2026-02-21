@@ -36,12 +36,11 @@ const processQueue = (error: unknown, token: string | null = null) => {
     failedQueue = [];
 };
 
-console.log("[api-client] baseURL =", API_URL);
 
 const api = axios.create({
     baseURL: API_URL,
     withCredentials: true,
-    timeout: 15_000,
+    timeout: 60000,
     headers: { "Content-Type": "application/json" },
 });
 

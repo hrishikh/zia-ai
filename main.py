@@ -1,122 +1,125 @@
 #!/usr/bin/env python3
 """
-Zia - Neural Agent (Unrestricted Access Mode)
+Zia v1 — Personal AI Agent
+Entry point: CLI or voice mode.
 """
 
 import sys
 import argparse
-import os
-from dotenv import load_dotenv
+import logging
 
-# 1. Force Load Environment Variables
-load_dotenv()
+from core.config import settings
+from core.brain import ZiaBrain
+from core.memory import ShortTermMemory
+from tools.base_tool import ToolRegistry
+from tools.email_tool import EmailTool
+from tools.os_tool import OpenFileTool, LaunchAppTool
+from tools.browser_tool import YouTubeTool, YouTubeControlTool
 
-from zia_core import ZiaCore
-from auth_manager import AuthorizationManager
-from executor import ActionExecutor
-from audit_logger import AuditLogger
-from voice_interface import VoiceInterface
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(name)-14s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("zia")
 
-class NeuralBypass:
-    """Bypasses standard safety prompts for direct system execution"""
-    @staticmethod
-    def grant_full_access(app):
-        # 1. Tell the auth manager to bypass all standard checks
-        app.auth_manager.bypass_mode = True
-        
-        # 2. Force-authorize system services in the permission file
-        services = ['gmail', 'spotify', 'twilio', 'filesystem', 'messaging', 'media player']
-        for service in services:
-            app.auth_manager.force_authorize(service)
-        
-        # 3. Disable internal confirmation checks in the core engine
-        app.core.unrestricted_mode = True
 
-class ZiaApp:
-    """Main Zia application with Administrative Privileges"""
-    
-    def __init__(self, voice_mode: bool = False):
-        self.voice_mode = voice_mode
-        
-        # Initialize components
-        self.auth_manager = AuthorizationManager()
-        self.audit_logger = AuditLogger()
-        self.executor = ActionExecutor(self.auth_manager, self.audit_logger)
-        self.core = ZiaCore()
-        
-        # NEURAL BYPASS: Grant total access immediately
-        NeuralBypass.grant_full_access(self)
-        
-        # Inject dependencies
-        self.core.auth_manager = self.auth_manager
-        self.core.executor = self.executor
-        self.core.audit_logger = self.audit_logger
-        
-        if voice_mode:
-            self.voice = VoiceInterface()
-        else:
-            self.voice = None
-    
-    def run(self):
-        """Main application loop with High-Priority Execution"""
-        print("\n" + "="*50)
-        print("🎙️  Zia - Neural Agent (ADMIN ACCESS ENABLED)")
-        print("="*50)
-        print("\nNeural Link Active. Listening for commands...\n")
-        
-        while True:
-            try:
-                if self.voice_mode and self.voice:
-                    user_input = self.voice.listen()
-                    if not user_input: continue
-                else:
-                    user_input = input("\n💬 You: ").strip()
-                
-                if not user_input: continue
-                if user_input.lower() in ['exit', 'quit', 'bye']:
-                    print("\n👋 System Disconnected. Goodbye!")
-                    break
-                
-                # Process input
-                response = self.core.process_input(user_input)
-                
-                if self.voice_mode and self.voice:
-                    self.voice.speak(response)
-                else:
-                    print(f"\n🤖 Zia: {response}")
-            
-            except KeyboardInterrupt:
-                print("\n\n👋 Neural Link Severed. Goodbye!")
+def build_agent() -> ZiaBrain:
+    """Wire up the tool registry, memory, and brain."""
+    # Validate config
+    missing = settings.validate()
+    if missing:
+        print(f"❌ Missing required environment variables: {', '.join(missing)}")
+        print("   Set them in your .env file and restart.")
+        sys.exit(1)
+
+    # Tool registry
+    registry = ToolRegistry()
+    registry.register(EmailTool())
+    registry.register(OpenFileTool())
+    registry.register(LaunchAppTool())
+    registry.register(YouTubeTool())
+    registry.register(YouTubeControlTool())
+
+    # Memory
+    memory = ShortTermMemory(max_turns=settings.MAX_CONVERSATION_TURNS)
+
+    # Brain
+    brain = ZiaBrain(registry=registry, memory=memory)
+
+    logger.info(
+        "Zia v1 ready — %d tools loaded: %s",
+        len(registry.tool_names),
+        ", ".join(registry.tool_names),
+    )
+    return brain
+
+
+def run_cli(brain: ZiaBrain):
+    """Interactive CLI loop."""
+    print("\n" + "=" * 50)
+    print("  Zia v1 — Personal AI Agent")
+    print("=" * 50)
+    print("  Type your request. Say 'exit' to quit.\n")
+
+    while True:
+        try:
+            user_input = input("💬 You: ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ("exit", "quit", "bye"):
+                print("\n👋 Goodbye!")
                 break
-            except Exception as e:
-                error_msg = f"Neural execution error: {str(e)}"
-                print(f"\n❌ {error_msg}")
-                if self.voice_mode and self.voice:
-                    self.voice.speak(error_msg)
 
-    def setup_service(self, service: str):
-        print(f"\n🔧 Bridging {service} to Neural Link...")
-        scope_map = {
-            'gmail': ['https://www.googleapis.com/auth/gmail.modify'],
-            'spotify': ['user-read-playback-state', 'user-modify-playback-state']
-        }
-        scopes = scope_map.get(service, [])
-        if self.auth_manager.authorize_service(service, scopes):
-            print(f"✅ {service} integrated successfully!")
-        else:
-            print(f"❌ Integration failed for {service}")
+            response = brain.think(user_input)
+            print(f"\n🤖 Zia: {response}\n")
+
+        except KeyboardInterrupt:
+            print("\n\n👋 Goodbye!")
+            break
+        except Exception as e:
+            print(f"\n❌ Error: {e}\n")
+
+
+def run_voice(brain: ZiaBrain):
+    """Voice input/output loop."""
+    from interface.voice import VoiceInterface
+
+    voice = VoiceInterface()
+    print("\n🎙️  Zia v1 — Voice Mode Active")
+    print("   Listening for commands...\n")
+
+    while True:
+        try:
+            user_input = voice.listen()
+            if not user_input:
+                continue
+            if user_input.lower() in ("exit", "quit", "bye", "stop"):
+                voice.speak("Goodbye!")
+                break
+
+            response = brain.think(user_input)
+            voice.speak(response)
+
+        except KeyboardInterrupt:
+            print("\n👋 Goodbye!")
+            break
+        except Exception as e:
+            voice.speak(f"Error: {e}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Zia - Neural Agent")
-    parser.add_argument('--voice', action='store_true', help='Enable voice mode')
-    parser.add_argument('--setup', type=str, help='Setup a service (gmail, spotify)')
+    parser = argparse.ArgumentParser(description="Zia v1 — Personal AI Agent")
+    parser.add_argument("--voice", action="store_true", help="Enable voice mode")
     args = parser.parse_args()
-    app = ZiaApp(voice_mode=args.voice)
-    
-    if args.setup:
-        app.setup_service(args.setup)
-        return
-    app.run()
 
-if __name__ == '__main__':
+    brain = build_agent()
+
+    if args.voice:
+        run_voice(brain)
+    else:
+        run_cli(brain)
+
+
+if __name__ == "__main__":
     main()
