@@ -1,9 +1,11 @@
 """
 Zia AI — FastAPI Application Entrypoint
-Production-grade middleware stack, lifespan management, and route mounting.
+Production-grade middleware stack, lifespan management, route mounting,
+and Zia Brain (Groq LLM) integration.
 """
 
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -15,19 +17,44 @@ from app.middleware.rate_limit import SlidingWindowRateLimiter
 from app.middleware.versioning import APIVersionMiddleware
 from app.middleware.metrics import PrometheusMiddleware, metrics_endpoint
 
+# ── Zia Brain imports (core/ and tools/ live inside backend/) ──
+from core.memory import ShortTermMemory
+from core.brain import ZiaBrain
+from tools.base_tool import ToolRegistry
+from tools.email_tool import EmailTool
+from tools.os_tool import OpenFileTool, LaunchAppTool
+from tools.browser_tool import YouTubeTool, YouTubeControlTool
+
+# ── Zia Brain singleton (shared across all requests) ──
+_registry = ToolRegistry()
+_registry.register(EmailTool())
+_registry.register(OpenFileTool())
+_registry.register(LaunchAppTool())
+_registry.register(YouTubeTool())
+_registry.register(YouTubeControlTool())
+
+_memory = ShortTermMemory(max_turns=20)
+
+brain = ZiaBrain(
+    registry=_registry,
+    memory=_memory,
+)
+
+print(f"🧠 Brain singleton created — model: {settings.GROQ_MODEL}")
+print(f"🔧 Tools loaded: {_registry.tool_names}")
+
+
+# ── Lifespan ──
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     print("🚀 Zia AI started successfully")
-    print("Loaded GOOGLE_CLIENT_ID:", bool(settings.GOOGLE_CLIENT_ID))
 
     yield
 
-    # Dispose DB engine on shutdown
     await engine.dispose()
 
 
@@ -59,9 +86,17 @@ app.include_router(api_router, prefix="/api/v1")
 app.add_route("/metrics", metrics_endpoint)
 
 
+# ── System Endpoints ──
+
 @app.get("/health", tags=["system"])
 async def health_check():
-    return {"status": "healthy", "version": "1.0.0", "service": "zia-ai"}
+    return {
+        "status": "healthy",
+        "version": "1.0.0",
+        "service": "zia-ai",
+        "brain_model": settings.GROQ_MODEL,
+        "tools": _registry.tool_names,
+    }
 
 
 @app.get("/", tags=["system"])

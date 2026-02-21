@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     WORKER_MAX_JOBS: int = 10
     WORKER_JOB_TIMEOUT: int = 300
 
+    # ── Groq (Zia Brain) ──
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+
     model_config = {"env_file": str(_ENV_FILE), "env_file_encoding": "utf-8"}
 
 
